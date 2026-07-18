@@ -24,7 +24,6 @@ test {
     _ = @import("servers/naming/main.zig");
     _ = @import("servers/display/manager.zig");
     _ = @import("servers/display/render.zig");
-    _ = @import("servers/display/quartz.zig");
     _ = @import("servers/display/surfaces.zig");
     _ = @import("servers/filesystem/format.zig");
 

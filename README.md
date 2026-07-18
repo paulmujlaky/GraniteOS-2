@@ -19,6 +19,7 @@ ships with a persistent on-disk filesystem plus an optional (but highly recommen
 zig build # kernel image + user module bundle + persistent disk seed (zig-out/bin)
 zig build qemu # boot the full system under QEMU virt (interactive; quit with Ctrl-A x)
 zig build qemu-gui # SDL desktop with virtio GPU, input, and sound
+zig build qemu-gpu # SDL/OpenGL desktop with virgl-backed VirtIO GPU acceleration
 zig build qemu-nodisk # boot without a virtio-blk disk (the filesystem reports unavailable)
 zig build qemu-bare # boot the kernel alone; halts after initialization
 zig build qemu-debug # boot halted with a gdb stub on :1234
@@ -30,6 +31,9 @@ to size the virtual machine and persistent disk image (defaults: 4 cores,
 512 MiB RAM, 64 MiB disk). The default disk is `disk.img`; non-default sizes
 use `disk-<MiB>M.img`. A virtio-net NIC on QEMU's user-mode network is attached
 by default; pass `-Dnet=false` to boot without one.
+
+The virgl Quartz milestone has a required software/GPU capture matrix in
+[`_docs/quartz-gpu-parity.md`](_docs/quartz-gpu-parity.md).
 
 `zig build qemu` boots, discovers the machine from the device tree, logs each
 subsystem as it comes up (memory, interrupts, objects, and the SMP scheduler),

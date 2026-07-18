@@ -1,11 +1,15 @@
 // virtio-gpu display driver (07-userspace-ddd.md Section 12.2): an ordinary process holding its MMIO window, its Interrupt, and a DMA sub-grant.
 
+const std = @import("std");
+
 const lib = @import("lib");
 
 const cap = lib.cap;
 const ipc = lib.ipc;
 const proto = lib.proto;
 const sys = lib.sys;
+
+const virgl = @import("virgl.zig");
 
 const Handle = cap.Handle;
 const Message = ipc.Message;
@@ -59,6 +63,7 @@ const isr_config: u32 = 2;
 
 const config_events_read = reg_config + 0;
 const config_events_clear = reg_config + 4;
+const config_capset_count = reg_config + 12;
 
 const event_display: u32 = 1;
 
@@ -258,18 +263,20 @@ const Used = extern struct {
 
 };
 
-// Control DMA: two pages per queue (legacy used-page alignment), command/response page, then cursor image.
+// Control DMA: two pages per queue, a large 3D command area, one response page, then cursor image.
 
 const page_size = 4096;
 
 const controlq_offset = 0;
 const cursorq_offset = 2 * page_size;
 const command_offset = 4 * page_size;
-const response_offset = command_offset + 2048;
-const cursor_offset = 5 * page_size;
+const command_capacity = 8 * page_size;
+const response_offset = command_offset + command_capacity;
+const response_capacity = page_size;
+const cursor_offset = response_offset + response_capacity;
 
 const cursor_bytes = proto.display.cursor_size * proto.display.cursor_size * 4;
-const dma_pages = 5 + (cursor_bytes + page_size - 1) / page_size;
+const dma_pages = cursor_offset / page_size + (cursor_bytes + page_size - 1) / page_size;
 
 const avail_offset = queue_size * @sizeOf(Descriptor);
 const used_offset = page_size;
@@ -283,11 +290,13 @@ const notification_bit: u64 = 1;
 const tick_bit: u64 = 2;
 
 const watchdog_tick_ns: u64 = 10_000_000;
-const control_submit_timeout_ns: u64 = 250_000_000;
+const control_submit_timeout_ns: u64 = 2_000_000_000;
 const cursor_submit_timeout_ns: u64 = 50_000_000;
 
 var regs: usize = 0;
 var version: u32 = 0;
+var virgl_feature = false;
+var context_init_feature = false;
 
 var dma_base: usize = 0;
 var dma_physical: u64 = 0;
@@ -307,6 +316,7 @@ var fb_resource: u32 = 0;
 var next_resource: u32 = 2;
 
 var cursor_ready = false;
+var virgl_renderer = virgl.Renderer{};
 
 // The compositor's mode-change Notification (attach_events).
 
@@ -358,6 +368,7 @@ fn run() !void {
 
     try init_device();
     try init_scanout();
+    init_virgl();
 
     var in = Message.zeroed;
 
@@ -400,9 +411,25 @@ fn init_device() !void {
     if (version == 2) {
 
         reg_write(reg_device_features_sel, 0);
-        _ = reg_read(reg_device_features);
+        const low_features = reg_read(reg_device_features);
+        var accepted_low: u32 = 0;
+
+        if (low_features & 1 != 0) {
+
+            accepted_low |= 1;
+            virgl_feature = true;
+
+        }
+
+        if (low_features & (1 << 4) != 0 and virgl_feature) {
+
+            accepted_low |= 1 << 4;
+            context_init_feature = true;
+
+        }
+
         reg_write(reg_driver_features_sel, 0);
-        reg_write(reg_driver_features, 0);
+        reg_write(reg_driver_features, accepted_low);
 
         reg_write(reg_device_features_sel, 1);
         _ = reg_read(reg_device_features);
@@ -415,8 +442,24 @@ fn init_device() !void {
 
     } else {
 
-        _ = reg_read(reg_device_features);
-        reg_write(reg_driver_features, 0);
+        const features = reg_read(reg_device_features);
+        var accepted: u32 = 0;
+
+        if (features & 1 != 0) {
+
+            accepted |= 1;
+            virgl_feature = true;
+
+        }
+
+        if (features & (1 << 4) != 0 and virgl_feature) {
+
+            accepted |= 1 << 4;
+            context_init_feature = true;
+
+        }
+
+        reg_write(reg_driver_features, accepted);
         reg_write(reg_guest_page_size, page_size);
 
     }
@@ -466,6 +509,54 @@ fn init_scanout() !void {
     const size = try query_display();
 
     try build_framebuffer(size.width, size.height);
+
+}
+
+fn init_virgl() void {
+
+    if (!virgl_feature) {
+
+        lib.log.line("Quartz GPU init: VIRTIO_GPU_F_VIRGL unavailable\n");
+
+        return;
+
+    }
+
+    const capset_count = reg_read(config_capset_count);
+
+    lib.log.fmt("Quartz GPU init: feature ready, capsets={d} context_init={d}\n", .{
+
+        capset_count,
+        @intFromBool(context_init_feature),
+
+    });
+
+    virgl_renderer.initialize(.{
+
+        .submit = &virgl_submit,
+        .submit_nodata_batch = &virgl_submit_nodata_batch,
+        .present = &virgl_present,
+        .restore_scanout = &rewire_scanout,
+
+    }, capset_count, context_init_feature) catch |failure| {
+
+        lib.log.fmt("Quartz GPU init: renderer unavailable: {s}\n", .{@errorName(failure)});
+
+        return;
+
+    };
+
+    virgl_renderer.proof(mode_width, mode_height) catch |failure| {
+
+        lib.log.fmt("Quartz GPU init: proof failed: {s}\n", .{@errorName(failure)});
+
+        virgl_renderer.shutdown();
+
+        return;
+
+    };
+
+    lib.log.line("Quartz GPU init: ready\n");
 
 }
 
@@ -597,6 +688,12 @@ fn build_framebuffer(width: u32, height: u32) !void {
 
     // The compositor owns visible pixels; do not flush from here or we race ahead of its first composite.
 
+    if (virgl_renderer.ready()) {
+
+        virgl_renderer.reset_for_resize(width, height) catch virgl_renderer.shutdown();
+
+    }
+
 }
 
 fn rewire_scanout() !void {
@@ -626,10 +723,213 @@ fn dispatch(method: u64, in: *const Message, out: *Message) i64 {
         proto.display.attach_events => attach_events(in),
         proto.display.set_cursor => set_cursor(in),
         proto.display.move_cursor => move_cursor(in.data[1]),
+        proto.display.quartz_info => quartz_info(out),
+        proto.display.quartz_composite => quartz_composite(in),
+        proto.display.quartz_metrics => quartz_metrics(out),
+        proto.display.quartz_header => quartz_header(in),
 
         else => -7, // Invalid: servers reuse the shared codes (05-server-protocol.md)
 
     };
+
+}
+
+fn virgl_present(resource_id: u32, width: u32, height: u32) !void {
+
+    try check_ok(try command(SetScanout, .{
+
+        .header = header_of(cmd_set_scanout),
+        .rect = .{ .x = 0, .y = 0, .width = width, .height = height },
+
+        .scanout_id = 0,
+        .resource_id = resource_id,
+
+    }));
+
+    try check_ok(try command(ResourceFlush, .{
+
+        .header = header_of(cmd_resource_flush),
+        .rect = .{ .x = 0, .y = 0, .width = width, .height = height },
+
+        .resource_id = resource_id,
+        .padding = 0,
+
+    }));
+
+}
+
+fn virgl_submit(bytes: []const u8, response: []u8) !u32 {
+
+    return submit_response(controlq, bytes.len, bytes.ptr, response);
+
+}
+
+fn virgl_submit_nodata_batch(requests: []const virgl.NodataRequest) !void {
+
+    try submit_nodata_batch(requests);
+
+}
+
+fn quartz_info(out: *Message) i64 {
+
+    out.data[1] = if (virgl_renderer.ready()) 1 else 0;
+
+    return 0;
+
+}
+
+fn quartz_composite(in: *const Message) i64 {
+
+    const close_count = @min(in.handle_count, @as(u32, in.handles.len));
+
+    defer {
+
+        for (in.handles[0..@intCast(close_count)]) |slot| sys.close(slot.handle) catch {};
+
+    }
+
+    if (!virgl_renderer.ready()) return -7;
+    if (in.handle_count < 2) return -7;
+
+    const back_region = in.handles[0].handle;
+    const surface_region = in.handles[1].handle;
+
+    const back_base = sys.map(cap.self_space, back_region, 0, sys.read | sys.write) catch return -7;
+    defer sys.unmap(cap.self_space, back_base) catch {};
+
+    const surface_base = sys.map(cap.self_space, surface_region, 0, sys.read) catch return -7;
+    defer sys.unmap(cap.self_space, surface_base) catch {};
+
+    const visible = virgl.Rect{
+
+        .x = @intCast(in.data[1] >> 32),
+        .y = @truncate(in.data[1]),
+        .width = @intCast(in.data[2] >> 32),
+        .height = @truncate(in.data[2]),
+
+    };
+    const source_x: u32 = @intCast(in.data[3] >> 32);
+    const source_y: u32 = @truncate(in.data[3]);
+    const surface_width: u32 = @intCast(in.data[4] >> 32);
+    const surface_height: u32 = @truncate(in.data[4]);
+
+    if (surface_width == 0 or surface_height == 0) return -7;
+    if (surface_width > 8192 or surface_height > 8192) return -7;
+
+    const foreground: [*]const u32 = @ptrFromInt(surface_base);
+    const pixel_count = @as(usize, surface_width) * surface_height;
+    const effect: [*]const u8 = @ptrFromInt(surface_base + pixel_count * @sizeOf(u32));
+    const back: [*]u32 = @ptrFromInt(back_base);
+
+    const density_word = in.data[5];
+    const density: u8 = @truncate(density_word);
+    const material_only = density_word & 0x100 != 0;
+
+    virgl_renderer.composite(
+        back,
+        mode_width,
+        foreground,
+        effect,
+        surface_width,
+        surface_height,
+        visible,
+        source_x,
+        source_y,
+        mode_width,
+        mode_height,
+        density,
+        material_only,
+    ) catch |failure| {
+
+        lib.log.fmt("Quartz GPU: panel resolve failed: {s}\n", .{@errorName(failure)});
+
+        virgl_renderer.shutdown();
+
+        return -7;
+
+    };
+
+    return 0;
+
+}
+
+fn quartz_header(in: *const Message) i64 {
+
+    const close_count = @min(in.handle_count, @as(u32, in.handles.len));
+
+    defer {
+
+        for (in.handles[0..@intCast(close_count)]) |slot| sys.close(slot.handle) catch {};
+
+    }
+
+    if (!virgl_renderer.ready()) return -7;
+    if (in.handle_count < 1) return -7;
+
+    const back_base = sys.map(cap.self_space, in.handles[0].handle, 0, sys.read | sys.write) catch return -7;
+    defer sys.unmap(cap.self_space, back_base) catch {};
+
+    const visible = virgl.Rect{
+
+        .x = @intCast(in.data[1] >> 32),
+        .y = @truncate(in.data[1]),
+        .width = @intCast(in.data[2] >> 32),
+        .height = @truncate(in.data[2]),
+
+    };
+    const source_x: u32 = @intCast(in.data[3] >> 32);
+    const source_y: u32 = @truncate(in.data[3]);
+    const header_width: u32 = @intCast(in.data[4] >> 32);
+    const header_height: u32 = @truncate(in.data[4]);
+    const style = in.data[5];
+
+    virgl_renderer.composite_header(
+        @ptrFromInt(back_base),
+        mode_width,
+        visible,
+        source_x,
+        source_y,
+        header_width,
+        header_height,
+        @truncate(style),
+        @truncate(style >> 32),
+        @truncate(style >> 40),
+        style & (@as(u64, 1) << 48) != 0,
+        @truncate(style >> 56),
+        mode_width,
+        mode_height,
+        style & (@as(u64, 1) << 49) != 0,
+    ) catch |failure| {
+
+        lib.log.fmt("Quartz GPU: header resolve failed: {s}\n", .{@errorName(failure)});
+
+        virgl_renderer.shutdown();
+
+        return -7;
+
+    };
+
+    return 0;
+
+}
+
+fn quartz_metrics(out: *Message) i64 {
+
+    const metrics = virgl_renderer.snapshot_metrics();
+    const captures: u32 = @intCast(@min(metrics.backdrop_captures, 0xffff_ffff));
+    const blur_passes: u32 = @intCast(@min(metrics.blur_passes, 0xffff_ffff));
+    const submissions: u32 = @intCast(@min(metrics.submissions, 0xffff_ffff));
+    const readbacks: u32 = @intCast(@min(metrics.readbacks, 0xffff_ffff));
+    const resolves: u32 = @intCast(@min(metrics.resolves, 0xffff_ffff));
+    const workspace_hits: u32 = @intCast(@min(metrics.workspace_hits, 0xffff_ffff));
+
+    out.data[1] = (@as(u64, resolves) << 32) | workspace_hits;
+    out.data[2] = metrics.pixels;
+    out.data[3] = (@as(u64, captures) << 32) | blur_passes;
+    out.data[4] = (@as(u64, submissions) << 32) | readbacks;
+    out.data[5] = metrics.elapsed_ns;
+
+    return 0;
 
 }
 
@@ -949,6 +1249,14 @@ fn as_bytes(comptime T: type, payload: *const T) [*]const u8 {
 
 fn submit(queue: u32, length: usize, bytes: [*]const u8) !u32 {
 
+    return submit_response(queue, length, bytes, null);
+
+}
+
+fn submit_response(queue: u32, length: usize, bytes: [*]const u8, response_out: ?[]u8) !u32 {
+
+    if (length > command_capacity) return error.Invalid;
+
     const queue_offset: usize = if (queue == controlq) controlq_offset else cursorq_offset;
     const queue_base = dma_base + queue_offset;
 
@@ -961,7 +1269,7 @@ fn submit(queue: u32, length: usize, bytes: [*]const u8) !u32 {
     const descriptors: [*]volatile Descriptor = @ptrFromInt(queue_base);
 
     descriptors[0] = .{ .addr = dma_physical + command_offset, .len = @intCast(length), .flags = descriptor_next, .next = 1 };
-    descriptors[1] = .{ .addr = dma_physical + response_offset, .len = 2048, .flags = descriptor_write, .next = 0 };
+    descriptors[1] = .{ .addr = dma_physical + response_offset, .len = response_capacity, .flags = descriptor_write, .next = 0 };
 
     const avail: *volatile Avail = @ptrFromInt(queue_base + avail_offset);
 
@@ -993,12 +1301,22 @@ fn submit(queue: u32, length: usize, bytes: [*]const u8) !u32 {
 
         if (used.idx != last_used[queue]) {
 
+            const used_element = used.ring[last_used[queue] % queue_size];
             last_used[queue] = used.idx;
 
             acknowledge_used();
             _ = sys.acknowledge(cap.driver.interrupt) catch {};
 
             note_display_config_event();
+
+            if (response_out) |out| {
+
+                const count = @min(out.len, @as(usize, used_element.len));
+                const source: [*]const u8 = @ptrFromInt(dma_base + response_offset);
+
+                @memcpy(out[0..count], source[0..count]);
+
+            }
 
             return response.kind;
 
@@ -1012,6 +1330,102 @@ fn submit(queue: u32, length: usize, bytes: [*]const u8) !u32 {
         _ = sys.acknowledge(cap.driver.interrupt) catch {};
 
         note_display_config_event();
+
+    }
+
+}
+
+fn submit_nodata_batch(requests: []const virgl.NodataRequest) !void {
+
+    if (requests.len == 0) return;
+    if (requests.len > queue_size / 2) return error.Invalid;
+
+    const queue_base = dma_base + controlq_offset;
+    const command_buffer: [*]u8 = @ptrFromInt(dma_base + command_offset);
+    const descriptors: [*]volatile Descriptor = @ptrFromInt(queue_base);
+    const avail: *volatile Avail = @ptrFromInt(queue_base + avail_offset);
+    const used: *volatile Used = @ptrFromInt(queue_base + used_offset);
+    var command_cursor: usize = 0;
+
+    for (requests, 0..) |request, index| {
+
+        if (request.bytes.len < @sizeOf(CtrlHeader)) return error.Invalid;
+        if (command_cursor + request.bytes.len > command_capacity) return error.Invalid;
+
+        @memcpy(command_buffer[command_cursor .. command_cursor + request.bytes.len], request.bytes);
+
+        const command_address = dma_physical + @as(u64, @intCast(command_offset + command_cursor));
+        const response_address = dma_physical + @as(u64, @intCast(response_offset + index * @sizeOf(CtrlHeader)));
+        const response: *volatile CtrlHeader = @ptrFromInt(dma_base + response_offset + index * @sizeOf(CtrlHeader));
+        response.kind = 0;
+
+        const head: u16 = @intCast(index * 2);
+        descriptors[head] = .{
+
+            .addr = command_address,
+            .len = @intCast(request.bytes.len),
+            .flags = descriptor_next,
+            .next = head + 1,
+
+        };
+        descriptors[head + 1] = .{
+
+            .addr = response_address,
+            .len = @sizeOf(CtrlHeader),
+            .flags = descriptor_write,
+            .next = 0,
+
+        };
+
+        avail.ring[(avail.idx + @as(u16, @intCast(index))) % queue_size] = head;
+        command_cursor = (command_cursor + request.bytes.len + 3) & ~@as(usize, 3);
+
+    }
+
+    const expected_used = last_used[controlq] +% @as(u16, @intCast(requests.len));
+
+    barrier();
+    avail.idx +%= @intCast(requests.len);
+    barrier();
+    reg_write(reg_queue_notify, controlq);
+
+    const deadline = lib.time.now_ns() + control_submit_timeout_ns * @as(u64, @intCast(requests.len));
+
+    @atomicStore(bool, &submit_in_flight, true, .release);
+    defer @atomicStore(bool, &submit_in_flight, false, .release);
+
+    sys.notify(watchdog_arm, tick_bit) catch {};
+
+    while (true) {
+
+        barrier();
+
+        if (used.idx == expected_used) break;
+        if (lib.time.now_ns() >= deadline) return error.Gone;
+
+        _ = sys.wait(device_wake) catch return error.Gone;
+        acknowledge_used();
+        _ = sys.acknowledge(cap.driver.interrupt) catch {};
+        note_display_config_event();
+
+    }
+
+    last_used[controlq] = expected_used;
+    acknowledge_used();
+    _ = sys.acknowledge(cap.driver.interrupt) catch {};
+    note_display_config_event();
+
+    for (requests, 0..) |request, index| {
+
+        const request_header = std.mem.bytesToValue(CtrlHeader, request.bytes[0..@sizeOf(CtrlHeader)]);
+        const response: *volatile CtrlHeader = @ptrFromInt(dma_base + response_offset + index * @sizeOf(CtrlHeader));
+
+        if (response.kind != resp_ok_nodata) return error.Invalid;
+        if (request_header.flags & 1 != 0) {
+
+            if (response.flags & 1 == 0 or response.fence_id != request_header.fence_id) return error.Invalid;
+
+        }
 
     }
 

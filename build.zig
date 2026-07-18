@@ -231,6 +231,21 @@ pub fn build(b: *std.Build) void {
 
     add_qemu_step(b, kernel_image, bundle_image, .{
 
+        .name = "qemu-gpu",
+        .description = "Boot the desktop with virgl-backed VirtIO GPU acceleration",
+        .debug = false,
+        .test_build = test_build,
+        .disk = .{ .path = disk_path, .prepare = seedisk_run },
+        .smp = smp,
+        .memory = memory,
+        .gui = true,
+        .gpu = true,
+        .net = net,
+
+    }, qemu_runner);
+
+    add_qemu_step(b, kernel_image, bundle_image, .{
+
         .name = "qemu-nodisk",
         .description = "Boot the full system without a disk (the filesystem reports unavailable)",
         .debug = false,
@@ -424,6 +439,7 @@ const QemuStep = struct {
     smp: u64,
     memory: u64,
     gui: bool = false,
+    gpu: bool = false,
     net: bool = false,
 
 };
@@ -469,8 +485,8 @@ fn add_qemu_step(b: *std.Build, kernel: std.Build.LazyPath, initrd: ?std.Build.L
 
     if (step.gui) {
 
-        run.addArgs(&.{ "-display", "sdl" });
-        run.addArgs(&.{ "-device", "virtio-gpu-device" });
+        run.addArgs(&.{ "-display", if (step.gpu) "sdl,gl=on" else "sdl" });
+        run.addArgs(&.{ "-device", if (step.gpu) "virtio-gpu-gl-device" else "virtio-gpu-device" });
         run.addArgs(&.{ "-device", "virtio-keyboard-device" });
         run.addArgs(&.{ "-device", "virtio-tablet-device" });
         const audio_backend = if (builtin.os.tag == .windows) "dsound,id=granite-audio" else "sdl,id=granite-audio";

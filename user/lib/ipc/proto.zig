@@ -166,7 +166,7 @@ pub const filesystem = struct {
 pub const display = struct {
 
     pub const interface_id: u32 = 0x4449_5350; // "DISP"
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
 
     pub const mode_info: u16 = 1; // request: -                                  reply: (width<<32)|height, stride bytes, pixel format
     pub const map_framebuffer: u16 = 2; // request: -                                  reply: byte length, scanout Region in handle 0
@@ -174,6 +174,10 @@ pub const display = struct {
     pub const attach_events: u16 = 4; // request: bits, Notification in handle 0      reply: status
     pub const set_cursor: u16 = 5; // request: (hot_x<<32)|hot_y, image Region in handle 0   reply: status
     pub const move_cursor: u16 = 6; // request: (x<<32)|y                           reply: status
+    pub const quartz_info: u16 = 7; // request: -                                    reply: 1 when virgl Quartz is ready
+    pub const quartz_composite: u16 = 8; // request: visible/source/surface geometry, density; back + surface Regions   reply: status
+    pub const quartz_metrics: u16 = 9; // request: -                                  reply: packed resolves/workspace hits, pixels, captures/blur, submits/readbacks, elapsed ns
+    pub const quartz_header: u16 = 10; // request: visible/source/header geometry + style; back Region                 reply: status
 
     // The one pixel format v1 serves: 32-bit little-endian XRGB (blue in the low byte).
     pub const format_xrgb: u64 = 1;

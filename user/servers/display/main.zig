@@ -13,7 +13,6 @@ const sys = lib.sys;
 
 const manager_module = @import("manager.zig");
 const damage_module = @import("damage.zig");
-const quartz_effect = @import("quartz.zig");
 const render = @import("render.zig");
 const surfaces_module = @import("surfaces.zig");
 
@@ -78,7 +77,29 @@ var back: draw.Surface = undefined;
 
 var manager = Manager{};
 var surfaces = surfaces_module.Store(manager_module.max_windows){};
-var quartz_renderer = quartz_effect.Renderer{};
+var gpu_quartz_ready = false;
+var composite_batches: u64 = 0;
+var glass_cache_hits: u64 = 0;
+
+// Lens cache for hybrid GPU Quartz: when backdrop + geometry are unchanged,
+// blit the prior resolve instead of another upload/blur/readback round-trip.
+// Mirrors the software Quartz output cache (exact cover + halo invalidation).
+const glass_cache_capacity = 32;
+
+const GlassCache = struct {
+
+    valid: bool = false,
+    window: u32 = 0,
+    content: Rect = Rect.empty,
+    visible: Rect = Rect.empty,
+    backdrop: Rect = Rect.empty,
+
+};
+
+var glass_meta: [glass_cache_capacity]GlassCache = [_]GlassCache{.{}} ** glass_cache_capacity;
+var glass_region: Handle = 0;
+var glass_base: usize = 0;
+var glass: draw.Surface = undefined;
 
 // Per-client event rings, keyed by the badge the name service minted for the client.
 
@@ -130,6 +151,9 @@ var resize_dy: i32 = 0;
 
 var damage = damage_module.List{};
 var resize_damage: [manager_module.max_windows]Rect = [_]Rect{Rect.empty} ** manager_module.max_windows;
+// When true, the next Quartz resolve must recapture backdrop + rebuild frost.
+var quartz_backdrop_dirty: [manager_module.max_windows]bool = [_]bool{true} ** manager_module.max_windows;
+var quartz_header_backdrop_dirty: [manager_module.max_windows]bool = [_]bool{true} ** manager_module.max_windows;
 
 const ListWatch = struct {
 
@@ -249,8 +273,6 @@ fn load_compositor_theme() void {
     theme.chrome = chrome.chrome;
     theme.border = chrome.border;
 
-    quartz_renderer.invalidate();
-
 }
 
 fn chrome_colors() render.Chrome {
@@ -324,6 +346,14 @@ fn acquire_display() !void {
     try map_scanout();
     try build_back_buffer();
 
+    const gpu: ?Message = ipc.request(cap.compositor.display, proto.display.quartz_info, &.{}, &.{}) catch null;
+
+    if (gpu) |reply| gpu_quartz_ready = reply.data[1] != 0;
+
+    if (gpu_quartz_ready) ensure_glass_cache();
+
+    lib.log.fmt("Quartz GPU compositor: {s}\n", .{if (gpu_quartz_ready) "ready" else "flat fallback"});
+
     _ = try ipc.request(cap.compositor.display, proto.display.attach_events, &.{display_bit}, &.{
 
         .{ .handle = wake, .move = false },
@@ -369,11 +399,9 @@ fn map_scanout() !void {
 
 fn build_back_buffer() !void {
 
-    // Release both display-sized regions before reallocating so contiguous frames can coalesce.
-    quartz_renderer.release();
-
     if (back_base != 0) sys.unmap(cap.self_space, back_base) catch {};
     if (back_region != 0) sys.close(back_region) catch {};
+    release_glass_cache();
 
     const bytes = surfaces_module.surface_bytes(screen_width, screen_height, .xrgb) orelse return error.Invalid;
 
@@ -381,7 +409,38 @@ fn build_back_buffer() !void {
     back_base = try sys.map(cap.self_space, back_region, 0, sys.read | sys.write);
     back = draw.Surface.from_base(back_base, screen_width, screen_height, screen_width * 4);
 
-    quartz_renderer.resize(screen_width, screen_height) catch quartz_renderer.release();
+}
+
+fn release_glass_cache() void {
+
+    if (glass_base != 0) sys.unmap(cap.self_space, glass_base) catch {};
+    if (glass_region != 0) sys.close(glass_region) catch {};
+
+    glass_base = 0;
+    glass_region = 0;
+
+    for (&glass_meta) |*entry| entry.valid = false;
+
+}
+
+fn ensure_glass_cache() void {
+
+    if (glass_base != 0 or !gpu_quartz_ready) return;
+
+    const bytes = surfaces_module.surface_bytes(screen_width, screen_height, .xrgb) orelse return;
+
+    glass_region = sys.create(.region, bytes, cap.memory) catch return;
+    glass_base = sys.map(cap.self_space, glass_region, 0, sys.read | sys.write) catch {
+
+        sys.close(glass_region) catch {};
+        glass_region = 0;
+
+        return;
+
+    };
+
+    glass = draw.Surface.from_base(glass_base, screen_width, screen_height, screen_width * 4);
+    @memset(@as([*]u8, @ptrFromInt(glass_base))[0..bytes], 0);
 
 }
 
@@ -961,7 +1020,7 @@ fn id_of(raw: u64) ?u32 {
 
 }
 
-fn slot_of(window: *Window) usize {
+fn slot_of(window: *const Window) usize {
 
     return (@intFromPtr(window) - @intFromPtr(&manager.windows[0])) / @sizeOf(Window);
 
@@ -1389,6 +1448,7 @@ fn handle_mode_change() void {
 
     map_scanout() catch return;
     build_back_buffer() catch return;
+    if (gpu_quartz_ready) ensure_glass_cache();
 
     manager.resize_screen(screen_width, screen_height);
 
@@ -1426,13 +1486,16 @@ fn add_damage(rect: Rect) void {
     const halo = quartz_halo(clipped);
     const affected = if (halo > 0) clipped.inset(-halo).intersect(screen_bounds()) else clipped;
 
-    quartz_renderer.invalidate_region(affected);
+    mark_quartz_backdrop_dirty(affected, null);
+    glass_invalidate_region(affected);
     damage.add(affected);
 
 }
 
 fn add_surface_damage(window: *const Window, rect: Rect) void {
 
+    // Material changed on this surface; layers above must refresh frost, but this
+    // window can keep its frost (material-only GPU path) if its backdrop is clean.
     add_window_damage(window, rect);
 
 }
@@ -1452,12 +1515,56 @@ fn add_window_damage(window: *const Window, rect: Rect) void {
     const halo = quartz_halo_above(clipped, window);
     const affected = if (halo > 0) clipped.inset(-halo).intersect(screen_bounds()) else clipped;
 
-    quartz_renderer.invalidate_region(affected);
+    // Source window's own material is not a backdrop change for itself.
+    mark_quartz_backdrop_dirty(affected, window);
+    glass_invalidate_region(affected);
     damage.add(affected);
 
 }
 
+fn mark_quartz_backdrop_dirty(rect: Rect, except: ?*const Window) void {
+
+    if (rect.is_empty() or !gpu_quartz_ready) return;
+
+    var index: usize = 0;
+
+    while (index < manager.count) : (index += 1) {
+
+        const window = manager.stacked(index);
+
+        if (except) |skip| {
+
+            if (window.id == skip.id) continue;
+
+        }
+
+        if (window.flags & proto.window.flag_minimized != 0) continue;
+
+        const slot = slot_of(window);
+
+        if (window.flags & proto.window.flag_quartz != 0) {
+
+            if (!window.content().intersect(rect).is_empty()) quartz_backdrop_dirty[slot] = true;
+
+        }
+
+        if (window.decorated()) {
+
+            if (!window.title_bar().intersect(rect).is_empty()) quartz_header_backdrop_dirty[slot] = true;
+
+        }
+
+    }
+
+}
+
 fn add_movement_damage(window: *const Window, before: Rect, after: Rect) void {
+
+    // Placement changed: prior frost was for a different screen position.
+    const slot = slot_of(window);
+
+    quartz_backdrop_dirty[slot] = true;
+    quartz_header_backdrop_dirty[slot] = true;
 
     const covered = before.cover(after);
 
@@ -1482,7 +1589,7 @@ fn quartz_halo(rect: Rect) i32 {
 
 fn quartz_halo_above(rect: Rect, source: ?*const Window) i32 {
 
-    if (!quartz_renderer.ready() or lib.prefs.quartz_level == .off) return 0;
+    if (!gpu_quartz_ready or lib.prefs.quartz_level == .off) return 0;
 
     const max_layers: i32 = 3;
     var first: usize = 0;
@@ -1533,8 +1640,21 @@ fn quartz_halo_above(rect: Rect, source: ?*const Window) i32 {
 
         var layer_halo: i32 = 0;
 
-        if (window.flags & proto.window.flag_quartz != 0 and !window.content().intersect(affected).is_empty()) layer_halo = quartz_effect.damage_halo(density);
-        if (window.decorated() and !window.title_bar().intersect(affected).is_empty()) layer_halo = @max(layer_halo, quartz_effect.header_damage_halo(density));
+        if (window.flags & proto.window.flag_quartz != 0) {
+
+            const candidate = quartz_damage_halo(density);
+
+            if (backdrop_changed(window.content(), affected, candidate)) layer_halo = candidate;
+
+        }
+
+        if (window.decorated()) {
+
+            const candidate = quartz_header_damage_halo(density);
+
+            if (backdrop_changed(window.title_bar(), affected, candidate)) layer_halo = @max(layer_halo, candidate);
+
+        }
 
         if (layer_halo == 0) continue;
 
@@ -1548,6 +1668,38 @@ fn quartz_halo_above(rect: Rect, source: ?*const Window) i32 {
     }
 
     return halo;
+
+}
+
+fn quartz_damage_halo(level: u8) i32 {
+
+    return 24 + 2 * quartz_frost_radius(level);
+
+}
+
+fn quartz_header_damage_halo(level: u8) i32 {
+
+    return 14 + 2 * quartz_frost_radius(level);
+
+}
+
+fn quartz_frost_radius(level: u8) i32 {
+
+    return switch (level) {
+
+        1 => 3,
+        3 => 8,
+        else => 5,
+
+    };
+
+}
+
+fn backdrop_changed(layer: Rect, changed: Rect, halo: i32) bool {
+
+    if (layer.is_empty() or changed.is_empty() or halo <= 0) return false;
+
+    return !layer.inset(-halo).intersect(changed).is_empty();
 
 }
 
@@ -1572,15 +1724,15 @@ fn composite() !void {
     const pending = damage;
     damage.clear();
 
-    quartz_renderer.set_density(@intFromEnum(lib.prefs.quartz_level));
-
     // Client pixels may have been written in other processes; publish once before reading any surface.
     draw.fence();
 
     for (pending.rects[0..pending.len]) |region| {
 
-        const halo = quartz_halo(region);
-        const paint_region = if (halo > 0) region.inset(-halo).intersect(screen_bounds()) else region;
+        // Damage is expanded exactly once when queued. Generic and window
+        // damage already include the Quartz layers affected by their backdrop;
+        // overlay damage intentionally does not affect layers below it.
+        const paint_region = region;
         var first: usize = 0;
         var covered = false;
 
@@ -1647,6 +1799,174 @@ fn composite() !void {
 
     }
 
+    composite_batches += 1;
+
+    if (composite_batches % 60 == 0) report_quartz_metrics();
+
+}
+
+fn report_quartz_metrics() void {
+
+    if (!gpu_quartz_ready) return;
+
+    const gpu = ipc.request(cap.compositor.display, proto.display.quartz_metrics, &.{}, &.{}) catch return;
+
+    lib.log.fmt("Quartz GPU: resolves={d} pixels={d} captures={d} blur={d} workspace_hits={d} submits={d} readbacks={d} cache_hits={d} time_ns={d}\n", .{
+
+        gpu.data[1] >> 32,
+        gpu.data[2],
+        gpu.data[3] >> 32,
+        gpu.data[3] & 0xffff_ffff,
+        gpu.data[1] & 0xffff_ffff,
+        gpu.data[4] >> 32,
+        gpu.data[4] & 0xffff_ffff,
+        glass_cache_hits,
+        gpu.data[5],
+
+    });
+
+}
+
+fn glass_invalidate_region(rect: Rect) void {
+
+    if (rect.is_empty() or glass_base == 0) return;
+
+    for (&glass_meta) |*entry| {
+
+        // A lens depends on its sampled halo even when its output does not overlap the change.
+        if (entry.valid and !entry.backdrop.intersect(rect).is_empty()) entry.valid = false;
+
+    }
+
+}
+
+fn glass_rect_equal(a: Rect, b: Rect) bool {
+
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+
+}
+
+fn glass_rect_covers(outer: Rect, inner: Rect) bool {
+
+    if (inner.is_empty()) return true;
+    if (outer.is_empty()) return false;
+
+    return outer.x <= inner.x and outer.y <= inner.y and
+        outer.x + outer.w >= inner.x + inner.w and
+        outer.y + outer.h >= inner.y + inner.h;
+
+}
+
+fn glass_reusable(window: u32, content: Rect, visible: Rect) bool {
+
+    if (glass_base == 0 or visible.is_empty()) return false;
+
+    for (&glass_meta) |*entry| {
+
+        if (!entry.valid or entry.window != window) continue;
+        if (!glass_rect_equal(entry.content, content)) continue;
+        if (glass_rect_covers(entry.visible, visible)) return true;
+
+    }
+
+    return false;
+
+}
+
+fn glass_blit(visible: Rect) void {
+
+    if (glass_base == 0 or visible.is_empty()) return;
+
+    var y = visible.y;
+
+    while (y < visible.y + visible.h) : (y += 1) {
+
+        const start = @as(usize, @intCast(y)) * @as(usize, back.stride) + @as(usize, @intCast(visible.x));
+        const count: usize = @intCast(visible.w);
+
+        @memcpy(back.pixels[start .. start + count], glass.pixels[start .. start + count]);
+
+    }
+
+}
+
+fn glass_store(window: u32, content: Rect, visible: Rect, backdrop: Rect) void {
+
+    if (glass_base == 0 or visible.is_empty()) return;
+
+    // About to write this output into the lens: drop any other entry that sampled it.
+    for (&glass_meta) |*entry| {
+
+        if (!entry.valid or entry.window == window) continue;
+        if (!entry.backdrop.intersect(visible).is_empty()) entry.valid = false;
+
+    }
+
+    var y = visible.y;
+
+    while (y < visible.y + visible.h) : (y += 1) {
+
+        const start = @as(usize, @intCast(y)) * @as(usize, back.stride) + @as(usize, @intCast(visible.x));
+        const count: usize = @intCast(visible.w);
+
+        @memcpy(glass.pixels[start .. start + count], back.pixels[start .. start + count]);
+
+    }
+
+    var available: ?*GlassCache = null;
+    var existing: ?*GlassCache = null;
+
+    for (&glass_meta) |*entry| {
+
+        if (!entry.valid) {
+
+            if (available == null) available = entry;
+
+            continue;
+
+        }
+
+        if (entry.window == window) existing = entry;
+
+    }
+
+    const slot = existing orelse available orelse &glass_meta[@as(usize, window) % glass_meta.len];
+
+    // Keep a larger prior visible that already covers this paint.
+    if (slot.valid and slot.window == window and glass_rect_equal(slot.content, content) and glass_rect_covers(slot.visible, visible)) {
+
+        return;
+
+    }
+
+    // Expand the entry only when the new paint fully covers the old one (lens already holds those pixels).
+    if (slot.valid and slot.window == window and glass_rect_equal(slot.content, content) and glass_rect_covers(visible, slot.visible)) {
+
+        slot.visible = visible;
+        slot.backdrop = backdrop;
+
+        return;
+
+    }
+
+    slot.* = .{
+
+        .valid = true,
+        .window = window,
+        .content = content,
+        .visible = visible,
+        .backdrop = backdrop,
+
+    };
+
+}
+
+fn glass_backdrop_for(visible: Rect, density: u8, header: bool) Rect {
+
+    const halo = if (header) quartz_header_damage_halo(density) else quartz_damage_halo(density);
+
+    return visible.inset(-halo).intersect(screen_bounds());
+
 }
 
 fn covers(outer: Rect, inner: Rect) bool {
@@ -1660,6 +1980,142 @@ fn covers(outer: Rect, inner: Rect) bool {
 fn window_format(window: *const Window) draw.Format {
 
     return if (window.flags & proto.window.flag_quartz != 0) .alpha else .xrgb;
+
+}
+
+fn gpu_composite_window(window: *const Window, surface: *const draw.Surface, clip: Rect) bool {
+
+    if (!gpu_quartz_ready or lib.prefs.quartz_level == .off) return false;
+    if (window.flags & proto.window.flag_quartz == 0) return false;
+    if (surface.format != .alpha or surface.effect == null) return false;
+
+    const content = window.content();
+    const available = Rect{
+
+        .x = content.x,
+        .y = content.y,
+        .w = @intCast(surface.width),
+        .h = @intCast(surface.height),
+
+    };
+    // Full content resolve avoids frost seams between partial damage strips.
+    const visible = available.intersect(content).intersect(screen_bounds());
+
+    if (visible.is_empty()) return true;
+    if (visible.intersect(clip).is_empty()) return true;
+
+    if (glass_reusable(window.id, content, visible)) {
+
+        glass_blit(visible);
+        glass_cache_hits += 1;
+
+        return true;
+
+    }
+
+    const source_x: u32 = @intCast(visible.x - content.x);
+    const source_y: u32 = @intCast(visible.y - content.y);
+    const slot = slot_of(window);
+    const density: u8 = @intFromEnum(lib.prefs.quartz_level);
+    const material_only = !quartz_backdrop_dirty[slot];
+    const flags = @as(u64, density) | (if (material_only) @as(u64, 0x100) else 0);
+
+    draw.fence();
+
+    _ = ipc.request(cap.compositor.display, proto.display.quartz_composite, &.{
+
+        lib.window.pack_pair(@intCast(visible.x), @intCast(visible.y)),
+        lib.window.pack_pair(@intCast(visible.w), @intCast(visible.h)),
+        lib.window.pack_pair(source_x, source_y),
+        lib.window.pack_pair(surface.width, surface.height),
+        flags,
+
+    }, &.{
+
+        .{ .handle = back_region, .move = false },
+        .{ .handle = surfaces.region_of(slot), .move = false },
+
+    }) catch {
+
+        gpu_quartz_ready = false;
+        release_glass_cache();
+
+        return false;
+
+    };
+
+    draw.fence();
+
+    quartz_backdrop_dirty[slot] = false;
+    glass_store(window.id, content, visible, glass_backdrop_for(visible, density, false));
+
+    return true;
+
+}
+
+fn gpu_composite_header(window: *const Window, clip: Rect, tint: draw.Color, opacity: u8, joined: bool) bool {
+
+    if (!gpu_quartz_ready or lib.prefs.quartz_level == .off) return false;
+    if (opacity == 0) return false;
+
+    const header = window.title_bar();
+    // Full header bar — same seam avoidance as panels.
+    const visible = header.intersect(screen_bounds());
+
+    if (visible.is_empty()) return true;
+    if (visible.intersect(clip).is_empty()) return true;
+
+    const cache_key = window.id ^ 0x8000_0000;
+
+    if (glass_reusable(cache_key, header, visible)) {
+
+        glass_blit(visible);
+        glass_cache_hits += 1;
+
+        return true;
+
+    }
+
+    const slot = slot_of(window);
+    const density: u8 = @intFromEnum(lib.prefs.quartz_level);
+    const material_only = !quartz_header_backdrop_dirty[slot];
+    const radius: u64 = @intCast(render.corner_radius);
+    const style = @as(u64, tint) |
+        (@as(u64, opacity) << 32) |
+        (radius << 40) |
+        (@as(u64, @intFromBool(joined)) << 48) |
+        (@as(u64, @intFromBool(material_only)) << 49) |
+        (@as(u64, density) << 56);
+
+    draw.fence();
+
+    _ = ipc.request(cap.compositor.display, proto.display.quartz_header, &.{
+
+        lib.window.pack_pair(@intCast(visible.x), @intCast(visible.y)),
+        lib.window.pack_pair(@intCast(visible.w), @intCast(visible.h)),
+        lib.window.pack_pair(@intCast(visible.x - header.x), @intCast(visible.y - header.y)),
+        lib.window.pack_pair(@intCast(header.w), @intCast(header.h)),
+        style,
+
+    }, &.{
+
+        .{ .handle = back_region, .move = false },
+
+    }) catch {
+
+        gpu_quartz_ready = false;
+        release_glass_cache();
+
+        return false;
+
+    };
+
+    draw.fence();
+
+    quartz_header_backdrop_dirty[slot] = false;
+    glass_store(cache_key, header, visible, glass_backdrop_for(visible, density, true));
+
+    return true;
 
 }
 
@@ -1685,7 +2141,7 @@ fn draw_window(window: *Window, clip: Rect) void {
 
         const joined = window.flags & proto.window.flag_quartz != 0;
 
-        if (!quartz_renderer.composite_header(&back, window.title_bar(), clip, window.id, tint, opacity, render.corner_radius, joined)) {
+        if (!gpu_composite_header(window, clip, tint, opacity, joined)) {
 
             render.draw_title_bar(&view, window, focused, colors, face);
 
@@ -1701,7 +2157,7 @@ fn draw_window(window: *Window, clip: Rect) void {
 
     const surface = surfaces.surface_of(slot) orelse return;
 
-    if (lib.prefs.quartz_level == .off or window.flags & proto.window.flag_quartz == 0 or !quartz_renderer.composite(&back, &surface, window.content(), clip, window.id)) {
+    if (!gpu_composite_window(window, &surface, clip)) {
 
         render.blit_content(&back, window, &surface, clip, theme.border);
 

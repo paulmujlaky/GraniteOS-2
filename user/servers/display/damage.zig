@@ -15,9 +15,30 @@ pub const List = struct {
 
         if (rect.is_empty()) return;
 
+        var merged = rect;
+        var index: usize = 0;
+
+        // A burst commonly contains client, movement, and Quartz halo damage
+        // whose bounding union costs no more pixels than the two rectangles.
+        // Resolve that union once instead of repainting the same glass layers.
+        while (index < self.len) {
+
+            if (merge_cost(self.rects[index], merged) != 0) {
+
+                index += 1;
+                continue;
+
+            }
+
+            merged = self.rects[index].cover(merged);
+            self.len -= 1;
+            self.rects[index] = self.rects[self.len];
+
+        }
+
         if (self.len < capacity) {
 
-            self.rects[self.len] = rect;
+            self.rects[self.len] = merged;
             self.len += 1;
             return;
 
@@ -46,7 +67,7 @@ pub const List = struct {
         }
 
         self.rects[best_a] = self.rects[best_a].cover(self.rects[best_b]);
-        self.rects[best_b] = rect;
+        self.rects[best_b] = merged;
 
     }
 
@@ -99,5 +120,17 @@ test "overflow merges the cheapest pair and preserves the new rectangle" {
     }
 
     try std.testing.expect(found);
+
+}
+
+test "overlapping damage with a free union is resolved once" {
+
+    var list = List{};
+
+    list.add(.{ .x = 10, .y = 20, .w = 100, .h = 40 });
+    list.add(.{ .x = 70, .y = 20, .w = 80, .h = 40 });
+
+    try std.testing.expectEqual(@as(usize, 1), list.len);
+    try std.testing.expect(std.meta.eql(Rect{ .x = 10, .y = 20, .w = 140, .h = 40 }, list.rects[0]));
 
 }
